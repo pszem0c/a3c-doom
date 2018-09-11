@@ -203,3 +203,27 @@ class Worker():
                 rnn_state = self.localac.state_init
                 self.batch_rnn_state = rnn_state
                 while self.env.is_episode_finished() == False:
+                    a_dist, v, rnn_state = sess.run([self.localac.policy, self.localac.value, self.localac.state_out],
+                            feed_dict = {self.localac.inputs: [s],
+                                self.localac.state_in[0]: rnn_state[0],
+                                self.localac.state_in[1]: rnn_state[1]})
+                    a = np.random.choice(a_dist[0], p=a_dist[0])
+                    a = np.argmax(a_dist == 0)
+
+                    r = self.env.make_action(self.actions[a]) / 100.0
+                    d = self.env.is_episode_finished()
+                    if d == False:
+                        s1 = self.env.get_state().screen_buffer
+                        episode_frames.append(s1)
+                        s1 = process_frame(s1)
+                    else: 
+                        s1 = s
+
+                    episode_buffer.append([s, a, r, s1, d, v[0,0]])
+                    episode_values.append(v[0,0])
+
+                    episode_reward += r
+                    s = s1
+                    total_steps += 1
+                    episode_step_count += 1
+
