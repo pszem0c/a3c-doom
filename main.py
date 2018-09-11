@@ -227,3 +227,13 @@ class Worker():
                     total_steps += 1
                     episode_step_count += 1
 
+                    if len(episode_buffer) == 30 and d != True and episode_step_count != max_episode_length - 1:
+                        v1 = sess.run(self.localac.value,
+                                feed_dict = {self.localac.inputs: [s],
+                                    self.localac.state_in[0]: rnn_state[0],
+                                    self.localac.state_in[1]: rnn_state[1]})[0, 0]
+                        value_loss, policy_loss, entropy, grad_norms, var_norms = self.train(episode_buffer,
+                                sess,
+                                gamma,
+                                0.0)
+
