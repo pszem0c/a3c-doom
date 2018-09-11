@@ -182,4 +182,24 @@ class Worker():
                 feed_dict = feed_dict) 
         return value_loss / len(rollout), policy_loss / len(rollout), entropy / len(rollout), grad_norms, var_norms
 
+    def work(self, max_episode_length, gamma, sess, coord, saver):
+        episode_count = ess.run(self.global_episodes)
+        total_steps = 0
+        print("Starting worker " + str(self.number))
+        with sess.as_default(), sess.graph.as_default():
+            while not coord.should_stop():
+                sess.run(self.update_local_ops)
+                episode_buffer = []
+                episode_values = []
+                episode_frames = []
+                episode_reward = 0
+                episode_step_count = 0
+                d = False
 
+                self.env.new_episode()
+                s = self.env.get_state().screen_buffer
+                episode_frames.append(s)
+                s = process_frame(s)
+                rnn_state = self.localac.state_init
+                self.batch_rnn_state = rnn_state
+                while self.env.is_episode_finished() == False:
