@@ -5,6 +5,8 @@ import matplotlib.pyplot as plt
 import tensorflow as tf
 import tensorflow.contrib.slim as slim
 import scipy.signal
+import skimage
+from skimage import transform
 
 from helper import *
 from vizdoom import *
@@ -12,8 +14,41 @@ from vizdoom import *
 from random import choice
 from time import sleep
 from time import time
+import os
 
-def update_taregt_graph(from_scope, to_scope):
+def make_gif(images, fname, duration=2, true_image=False,salience=False,salIMGS=None):
+  import moviepy.editor as mpy
+  
+  def make_frame(t):
+    try:
+      x = images[int(len(images)/duration*t)]
+    except:
+      x = images[-1]
+
+    if true_image:
+      return x.astype(np.uint8)
+    else:
+      return ((x+1)/2*255).astype(np.uint8)
+  
+  def make_mask(t):
+    try:
+      x = salIMGS[int(len(salIMGS)/duration*t)]
+    except:
+      x = salIMGS[-1]
+    return x
+
+  clip = mpy.VideoClip(make_frame, duration=duration)
+  if salience == True:
+    mask = mpy.VideoClip(make_mask, ismask=True,duration= duration)
+    clipB = clip.set_mask(mask)
+    clipB = clip.set_opacity(0)
+    mask = mask.set_opacity(0.1)
+    mask.write_gif(fname, fps = len(images) / duration,verbose=False)
+    #clipB.write_gif(fname, fps = len(images) / duration,verbose=False)
+  else:
+    clip.write_gif(fname, fps = len(images) / duration,verbose=False)
+
+def update_target_graph(from_scope, to_scope):
     from_vars = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, from_scope)
     to_vars = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, to_scope)
 
@@ -24,12 +59,12 @@ def update_taregt_graph(from_scope, to_scope):
 
 def process_frame(frame):
     s = frame[10:-10, 30:-30]
-    s = scipy.misc.imresize(s,[84,84])
+    s = transform.resize(s,[84,84])
     s = np.reshape(s, [np.prod(s.shape)])/255.0
     return s
 
 def discount(x, gamma):
-    return scipi.signal.lfilter([1], [1, -gamma], x[::1], axis=0)[::-1]
+    return scipy.signal.lfilter([1], [1, -gamma], x[::1], axis=0)[::-1]
 
 def normalized_columns_initializer(std=1.0):
     def _initializer(shape, dtype=None, partition_info=None):
@@ -49,6 +84,7 @@ class ACNetwork():
                     num_outputs=16,
                     kernel_size=[8,8],
                     stride=[4,4],
+                    weights_initializer='random_uniform',
                     padding='VALID')
 
             self.conv2 = slim.conv2d(activation_fn=tf.nn.elu,
@@ -56,9 +92,11 @@ class ACNetwork():
                     num_outputs=32,
                     kernel_size=[4,4],
                     stride=[2,2],
+                    weights_initializer='random_uniform',
                     padding='VALID')
 
-            hidden = slim.fully_connected(slim.flatten(self.conv2), 256, activation_fn=tf.nn.elu)
+            hidden = slim.fully_connected(slim.flatten(self.conv2), 256, activation_fn=tf.nn.elu,
+                    weights_initializer='random_uniform')
 
             lstm_cell = tf.contrib.rnn.BasicLSTMCell(256, state_is_tuple=True)
             c_init = np.zeros((1, lstm_cell.state_size.c), np.float32)
@@ -69,7 +107,7 @@ class ACNetwork():
             self.state_in = (c_in, h_in)
             rnn_in = tf.expand_dims(hidden, [0])
             step_size = tf.shape(self.imageIn)[:1]
-            state_in = tf.contrib.rnn.LSTMStateTyple(c_in,h_in)
+            state_in = tf.contrib.rnn.LSTMStateTuple(c_in,h_in)
             lstm_outputs, lstm_state = tf.nn.dynamic_rnn(
                     lstm_cell, rnn_in, initial_state=state_in, sequence_length=step_size,
                     time_major=False)
@@ -130,7 +168,7 @@ class Worker():
         game.set_screen_resolution(ScreenResolution.RES_160X120)
         game.set_screen_format(ScreenFormat.GRAY8)
         game.set_render_hud(False)
-        game.set_render_crosshaird(False)
+        game.set_render_crosshair(False)
         game.set_render_weapon(True)
         game.set_render_decals(False)
         game.set_render_particles(False)
@@ -183,7 +221,7 @@ class Worker():
         return value_loss / len(rollout), policy_loss / len(rollout), entropy / len(rollout), grad_norms, var_norms
 
     def work(self, max_episode_length, gamma, sess, coord, saver):
-        episode_count = ess.run(self.global_episodes)
+        episode_count = sess.run(self.global_episodes)
         total_steps = 0
         print("Starting worker " + str(self.number))
         with sess.as_default(), sess.graph.as_default():
@@ -208,7 +246,7 @@ class Worker():
                                 self.localac.state_in[0]: rnn_state[0],
                                 self.localac.state_in[1]: rnn_state[1]})
                     a = np.random.choice(a_dist[0], p=a_dist[0])
-                    a = np.argmax(a_dist == 0)
+                    a = np.argmax(a_dist == a)
 
                     r = self.env.make_action(self.actions[a]) / 100.0
                     d = self.env.is_episode_finished()
@@ -235,5 +273,88 @@ class Worker():
                         value_loss, policy_loss, entropy, grad_norms, var_norms = self.train(episode_buffer,
                                 sess,
                                 gamma,
-                                0.0)
+                                v1)
+                        episode_buffer = []
+                        sess.run(self.update_local_ops)
+                    if d == True:
+                        break
 
+                self.episode_rewards.append(episode_reward)
+                self.episode_lengths.append(episode_step_count)
+                self.episode_mean_values.append(np.mean(episode_values))
+
+                if len(episode_buffer) != 0:
+                    value_loss, policy_loss, entropy, grad_norms, var_norms = self.train(episode_buffer, 
+                            sess,
+                            gamma,
+                            0.0)
+
+                if episode_count % 5 == 0 and episode_count != 0:
+                    if self.name == 'worker_0' and episode_count % 25 == 0:
+                        time_per_step = 0.05
+                        images = np.array(episode_frames)
+                        make_gif(images, './frames/image'+str(episode_count)+'.gif',
+                                duration=len(images)*time_per_step, true_image=True, salience=False)
+                    if episode_count % 250 == 0 and self.name == 'worker_0':
+                        saver.save(sess, self.model_path+'/model-'+str(episode_count)+'.cptk')
+                        print("Saved model")
+
+                    mean_reward = np.mean(self.episode_rewards[-5:])
+                    mean_length = np.mean(self.episode_lengths[-5:])
+                    mean_value = np.mean(self.episode_mean_values[-5:])
+                    summary = tf.Summary()
+                    summary.value.add(tag='Perf/Reward', simple_value=float(mean_reward))
+                    summary.value.add(tag='Perf/Length', simple_value=float(mean_length))
+                    summary.value.add(tag='Perf/Value', simple_value=float(mean_value))
+                    summary.value.add(tag='Losses/Value Loss', simple_value=float(value_loss))
+                    summary.value.add(tag='Losses/Policy Loss', simple_value=float(policy_loss))
+                    summary.value.add(tag='Losses/Entropy', simple_value=float(entropy))
+                    summary.value.add(tag='Losses/Grad Norm', simple_value=float(grad_norms))
+                    summary.value.add(tag='Losses/Var Norm', simple_value=float(var_norms))
+                    self.summary_writer.add_summary(summary, episode_count)
+                    self.summary_writer.flush()
+
+                if self.name == 'worker_0':
+                    sess.run(self.increment)
+                episode_count += 1
+
+max_episode_length = 300
+gamma = 0.99
+s_size = 7056
+a_size = 3
+load_model = False
+model_path = './model'
+
+tf.reset_default_graph()
+
+if not os.path.exists(model_path):
+    os.makedirs(model_path)
+
+with tf.device("/cpu:0"):
+    global_episodes = tf.Variable(0, dtype=tf.int32, name='global_episodes', trainable=False)
+    trainer = tf.train.AdamOptimizer(learning_rate=0.1)
+    master_network = ACNetwork(s_size, a_size, 'global', None)
+    num_workers = multiprocessing.cpu_count()
+    workers = []
+
+    for i in range(num_workers):
+        workers.append(Worker(DoomGame(), i, s_size, a_size, trainer, model_path, global_episodes))
+    saver = tf.train.Saver(max_to_keep=5)
+
+with tf.Session() as sess:
+    coord = tf.train.Coordinator()
+    if load_model == True:
+        print("Loading model...")
+        ckpt = tf.train.get_checkpoint_state(model_path)
+        saver.restore(sess, ckpt.model_checkpoint_path)
+    else:
+        sess.run(tf.global_variables_initializer())
+
+    worker_threads = []
+    for worker in workers:
+        worker_work = lambda: worker.work(max_episode_length, gamma, sess, coord, saver)
+        t = threading.Thread(target=(worker_work))
+        t.start()
+        sleep(0.5)
+        worker_threads.append(t)
+    coord.join(worker_threads)
